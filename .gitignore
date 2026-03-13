@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+
+# Generated experiment artifacts
+results/*.json
+results/*.csv
+reports/figures/
+
+# Keep placeholders
+!results/.gitkeep
+!reports/.gitkeep
