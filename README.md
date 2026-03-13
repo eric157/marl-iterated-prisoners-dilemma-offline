@@ -54,13 +54,3 @@ reports/
 - Supports memory length N with state size 4^N
 - Supports action noise (miscommunication)
 
-## Publish as its own repo
-
-```bash
-git init
-git add .
-git commit -m "Initial offline IPD experiments scaffold"
-git branch -M main
-git remote add origin <your-offline-repo-url>
-git push -u origin main
-```
