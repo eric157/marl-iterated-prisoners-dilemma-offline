@@ -15,7 +15,12 @@ import pandas as pd
 
 from ipd_project.environment.ipd_env import COOPERATE, DEFECT, IteratedPrisonersDilemmaEnv
 from ipd_project.agents.heuristic_agents import BaseAgent, build_heuristic_agent
-from ipd_project.agents.q_agent import QLearningAgent, QLearningConfig
+from ipd_project.agents.q_agent import (
+    OpponentAwareConfig,
+    OpponentAwareQLearningAgent,
+    QLearningAgent,
+    QLearningConfig,
+)
 
 
 EXPERIMENT_DEFS = {
@@ -39,6 +44,15 @@ class RunConfig:
     epsilon: float = 1.0
     epsilon_decay: float = 0.9992
     epsilon_min: float = 0.02
+    learner: str = "q"
+
+    prosocial_weight: float = 0.2
+    coop_bonus: float = 0.05
+    exploit_penalty: float = 0.06
+    negative_alpha_scale: float = 0.35
+    optimistic_init: float = 0.9
+    tie_break_cooperate: bool = True
+
     seed: int = 42
     run_sweeps: bool = True
     run_tournament: bool = True
@@ -48,10 +62,22 @@ class RunConfig:
 class AgentWrapper:
     """Adapter to unify Q-learning and heuristic agent interfaces."""
 
-    def __init__(self, kind: str, state_size: int, q_cfg: QLearningConfig, seed: int):
+    def __init__(
+        self,
+        kind: str,
+        state_size: int,
+        learner: str,
+        q_cfg: QLearningConfig,
+        oaq_cfg: OpponentAwareConfig,
+        seed: int,
+    ):
         self.kind = kind
+        self.learner = learner
         if kind == "q":
-            self.agent = QLearningAgent(state_size=state_size, config=q_cfg)
+            if learner == "oaq":
+                self.agent = OpponentAwareQLearningAgent(state_size=state_size, config=oaq_cfg)
+            else:
+                self.agent = QLearningAgent(state_size=state_size, config=q_cfg)
         else:
             self.agent = build_heuristic_agent(kind, seed=seed)
 
@@ -63,9 +89,26 @@ class AgentWrapper:
             return self.agent.act(state)
         return self.agent.act(own_history, opp_history, round_idx)
 
-    def update(self, state: int, action: int, reward: float, next_state: int, done: bool) -> None:
+    def update(
+        self,
+        state: int,
+        action: int,
+        reward: float,
+        next_state: int,
+        done: bool,
+        opp_action: int | None = None,
+        opp_reward: float | None = None,
+    ) -> None:
         if self.kind == "q":
-            self.agent.update(state, action, reward, next_state, done)
+            self.agent.update(
+                state,
+                action,
+                reward,
+                next_state,
+                done,
+                opp_action=opp_action,
+                opp_reward=opp_reward,
+            )
 
     def end_episode(self) -> None:
         if self.kind == "q":
@@ -96,12 +139,43 @@ def build_q_config(cfg: RunConfig, seed: int) -> QLearningConfig:
     )
 
 
+def build_oaq_config(cfg: RunConfig, seed: int) -> OpponentAwareConfig:
+    return OpponentAwareConfig(
+        alpha=cfg.alpha,
+        gamma=cfg.gamma,
+        epsilon=cfg.epsilon,
+        epsilon_decay=cfg.epsilon_decay,
+        epsilon_min=cfg.epsilon_min,
+        seed=seed,
+        prosocial_weight=cfg.prosocial_weight,
+        coop_bonus=cfg.coop_bonus,
+        exploit_penalty=cfg.exploit_penalty,
+        negative_alpha_scale=cfg.negative_alpha_scale,
+        optimistic_init=cfg.optimistic_init,
+        tie_break_cooperate=cfg.tie_break_cooperate,
+    )
+
+
 def run_experiment(defn: dict, cfg: RunConfig, seed_offset: int = 0) -> dict:
     env = IteratedPrisonersDilemmaEnv(memory=cfg.memory, noise=cfg.noise, seed=cfg.seed + seed_offset)
     state_size = env.state_size
 
-    a = AgentWrapper(defn["a"], state_size, build_q_config(cfg, cfg.seed + seed_offset + 1), cfg.seed + seed_offset + 11)
-    b = AgentWrapper(defn["b"], state_size, build_q_config(cfg, cfg.seed + seed_offset + 2), cfg.seed + seed_offset + 17)
+    a = AgentWrapper(
+        defn["a"],
+        state_size,
+        cfg.learner,
+        build_q_config(cfg, cfg.seed + seed_offset + 1),
+        build_oaq_config(cfg, cfg.seed + seed_offset + 1),
+        cfg.seed + seed_offset + 11,
+    )
+    b = AgentWrapper(
+        defn["b"],
+        state_size,
+        cfg.learner,
+        build_q_config(cfg, cfg.seed + seed_offset + 2),
+        build_oaq_config(cfg, cfg.seed + seed_offset + 2),
+        cfg.seed + seed_offset + 17,
+    )
 
     series: List[dict] = []
     for episode in range(cfg.episodes):
@@ -122,8 +196,24 @@ def run_experiment(defn: dict, cfg: RunConfig, seed_offset: int = 0) -> dict:
             next_state, reward_a, reward_b, exec_a, exec_b = env.step(action_a, action_b)
             done = round_idx == cfg.rounds - 1
 
-            a.update(state, action_a, reward_a, next_state, done)
-            b.update(state, action_b, reward_b, next_state, done)
+            a.update(
+                state,
+                action_a,
+                reward_a,
+                next_state,
+                done,
+                opp_action=exec_b,
+                opp_reward=reward_b,
+            )
+            b.update(
+                state,
+                action_b,
+                reward_b,
+                next_state,
+                done,
+                opp_action=exec_a,
+                opp_reward=reward_a,
+            )
 
             hist_a.append(exec_a)
             hist_b.append(exec_b)
@@ -219,10 +309,16 @@ def run_population(cfg: RunConfig) -> dict:
     rounds = max(60, min(cfg.rounds, 110))
 
     env = IteratedPrisonersDilemmaEnv(memory=cfg.memory, noise=cfg.noise, seed=cfg.seed + 777)
-    agents = [
-        QLearningAgent(state_size=env.state_size, config=build_q_config(cfg, cfg.seed + i + 1000))
-        for i in range(population_size)
-    ]
+    if cfg.learner == "oaq":
+        agents = [
+            OpponentAwareQLearningAgent(state_size=env.state_size, config=build_oaq_config(cfg, cfg.seed + i + 1000))
+            for i in range(population_size)
+        ]
+    else:
+        agents = [
+            QLearningAgent(state_size=env.state_size, config=build_q_config(cfg, cfg.seed + i + 1000))
+            for i in range(population_size)
+        ]
 
     rng = np.random.default_rng(cfg.seed + 99)
     series: List[dict] = []
@@ -251,8 +347,8 @@ def run_population(cfg: RunConfig) -> dict:
                 act_b = b.act(state)
                 next_state, ra, rb, ea, eb = env.step(act_a, act_b)
                 done = round_idx == rounds - 1
-                a.update(state, act_a, ra, next_state, done)
-                b.update(state, act_b, rb, next_state, done)
+                a.update(state, act_a, ra, next_state, done, opp_action=eb, opp_reward=rb)
+                b.update(state, act_b, rb, next_state, done, opp_action=ea, opp_reward=ra)
                 hist_a.append(ea)
                 hist_b.append(eb)
                 total_ra += ra
@@ -372,6 +468,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=1.0)
     parser.add_argument("--epsilon-decay", type=float, default=0.9992)
     parser.add_argument("--epsilon-min", type=float, default=0.02)
+    parser.add_argument("--learner", type=str, default="q", choices=["q", "oaq"])
+    parser.add_argument("--prosocial-weight", type=float, default=0.2)
+    parser.add_argument("--coop-bonus", type=float, default=0.05)
+    parser.add_argument("--exploit-penalty", type=float, default=0.06)
+    parser.add_argument("--negative-alpha-scale", type=float, default=0.35)
+    parser.add_argument("--optimistic-init", type=float, default=0.9)
+    parser.add_argument("--tie-break", type=str, default="cooperate", choices=["cooperate", "random"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--experiments", type=str, default=",".join(EXPERIMENT_DEFS.keys()))
     parser.add_argument("--out-dir", type=str, default="results")
@@ -396,6 +499,13 @@ def main() -> None:
         epsilon=args.epsilon,
         epsilon_decay=args.epsilon_decay,
         epsilon_min=args.epsilon_min,
+        learner=args.learner,
+        prosocial_weight=args.prosocial_weight,
+        coop_bonus=args.coop_bonus,
+        exploit_penalty=args.exploit_penalty,
+        negative_alpha_scale=args.negative_alpha_scale,
+        optimistic_init=args.optimistic_init,
+        tie_break_cooperate=args.tie_break == "cooperate",
         seed=args.seed,
         run_sweeps=not args.no_sweeps,
         run_tournament=not args.no_tournament,

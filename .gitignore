@@ -6,9 +6,9 @@ __pycache__/
 .venv/
 
 # Generated experiment artifacts
-results/*.json
-results/*.csv
+results/**
 reports/figures/
+external/
 
 # Keep placeholders
 !results/.gitkeep
